@@ -224,7 +224,7 @@ pub fn validate_deposit_amount(
         Some(new_total) if new_total > max_contract_total => {
             Err(crate::EscrowError::InvalidMilestoneAmount)
         }
-        Some(_) => Ok(())),
+        Some(_) => Ok(()),
         None => Err(crate::EscrowError::PotentialOverflow),
     }
 }
