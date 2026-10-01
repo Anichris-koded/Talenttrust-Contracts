@@ -152,6 +152,7 @@ pub use dispute::DisputeInfo;
 pub use events::{EventInput, MAX_EVENT_BATCH_SIZE};
 pub use migration::{ContractV1, PendingClientMigration, CONTRACT_STORAGE_SCHEMA_VERSION};
 pub use milestones_consts::PROTOCOL_FEE_BPS_DENOMINATOR;
+pub use keys_recovery::{KeyRecoveryRecord, KeyRecoveryStatus};
 pub use proptest::{check_contract_invariants, InvariantViolation};
 pub use token_scale::{normalized_amount, scale_multiplier, MAX_TOKEN_DECIMALS};
 pub use ttl::{

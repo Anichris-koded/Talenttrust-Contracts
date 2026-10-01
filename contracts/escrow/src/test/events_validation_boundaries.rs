@@ -71,27 +71,27 @@ fn validate_amounts_accepts_all_zero() {
 
 #[test]
 fn validate_amounts_accepts_typical_values() {
-    assert_eq!(validate_event_amounts(1_000, 500, 200, 1_000), Ok(()));
+    assert_eq!(validate_event_amounts(500, 300, 200, 1_000), Ok(()));
 }
 
 #[test]
 fn validate_amounts_accepts_i128_max_funded() {
-    assert_eq!(validate_event_amounts(i128::MAX, 0, 0, 0), Ok(()));
+    assert_eq!(validate_event_amounts(i128::MAX, 0, 0, i128::MAX), Ok(()));
 }
 
 #[test]
 fn validate_amounts_accepts_i128_max_released() {
-    assert_eq!(validate_event_amounts(0, i128::MAX, 0, 0), Ok(()));
+    assert_eq!(validate_event_amounts(0, i128::MAX, 0, i128::MAX), Ok(()));
 }
 
 #[test]
 fn validate_amounts_accepts_i128_max_refunded() {
-    assert_eq!(validate_event_amounts(0, 0, i128::MAX, 0), Ok(()));
+    assert_eq!(validate_event_amounts(0, 0, i128::MAX, i128::MAX), Ok(()));
 }
 
 #[test]
 fn validate_amounts_accepts_i128_max_deposited() {
-    assert_eq!(validate_event_amounts(0, 0, 0, i128::MAX), Ok(()));
+    assert_eq!(validate_event_amounts(i128::MAX, 0, 0, i128::MAX), Ok(()));
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn contract_indexed_emits_for_every_status() {
             freelancer: Address::generate(&env),
             arbiter: None,
             status,
-            total_deposited: 100,
+            total_deposited: 160,
             funded_amount: 100,
             released_amount: 50,
             refunded_amount: 10,
