@@ -484,14 +484,14 @@ mod tests {
                 deposit_amount: 499,
                 current_deposited: 500,
                 max_contract_total: 1000,
-                expected: Ok(())),
+                expected: Ok(()),
             },
             TestCase {
                 name: "exactly remaining capacity should succeed",
                 deposit_amount: 500,
                 current_deposited: 500,
                 max_contract_total: 1000,
-                expected: Ok(())),
+                expected: Ok(()),
             },
             TestCase {
                 name: "one stroop over remaining capacity should fail with InvalidMilestoneAmount",
