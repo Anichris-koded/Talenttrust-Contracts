@@ -11,6 +11,14 @@ pub const CONTRACT_SUMMARY_SCHEMA_VERSION: u32 = 1;
 /// upgraded on read by `dispute::load_dispute_metadata`.
 pub const DISPUTE_STORAGE_VERSION: u32 = 1;
 
+/// Current on-ledger layout version for reputation storage.
+///
+/// v1 = legacy layout (only `DataKey::Reputation` present, no version marker).
+/// v2 = current layout (`DataKey::Reputation` + `DataKey::ReputationStorageVersion`).
+/// State writes belong exclusively in `migrate_reputation_storage` and
+/// `issue_reputation`; getters must stay read-only.
+pub const REPUTATION_STORAGE_VERSION: u32 = 2;
+
 /// Legacy (v0) dispute metadata layout without an embedded schema version.
 ///
 /// Retained solely so migrate-on-read can decode pre-versioned records and
@@ -124,9 +132,17 @@ pub enum DataKey {
     PauseScope,
     /// Monotonic admin nonce for replay protection.
     AdminNonce,
+    /// Monotonic admin-rotation revision, kept with the live contract instance.
+    AdminRotationRevision,
     Emergency,
     // Contract storage
     Contract(u32),
+    /// Per-record schema version written alongside each `Contract` entry.
+    ///
+    /// Absent means the record was written before versioning existed (schema v1).
+    /// When present, the value must equal [`crate::migration::CONTRACT_STORAGE_SCHEMA_VERSION`]
+    /// for the record to be considered current.
+    ContractSchemaVersion(u32),
     NextContractId,
     MilestoneReleased(u32, u32),
     MilestoneApprovals(u32, u32),
@@ -138,6 +154,10 @@ pub enum DataKey {
     PendingReputationCredits(Address),
     Reputation(Address),
     ReputationComment(u32),
+    /// Schema version marker for `Reputation(address)` (stored as u32).
+    /// Absent = v1 legacy layout. Present and equal to
+    /// [`REPUTATION_STORAGE_VERSION`](crate::REPUTATION_STORAGE_VERSION) = v2 current.
+    ReputationStorageVersion(Address),
     /// Index of addresses that have reputation records. Used by paginated readers.
     ReputationIndex,
     // Client migration
@@ -198,6 +218,12 @@ pub enum DataKey {
     /// All milestone amounts must be exactly representable at this scale (i.e.
     /// `amount % 10^decimals == 0` when interpreted as a human-visible value).
     TokenScale,
+    // Concurrent-execution hardening (#1535)
+    /// Per-contract mutation lock marking that a storage-mutating entrypoint is
+    /// currently in flight.  Written before the first state change and removed
+    /// when the guarded scope ends; never present outside an active call, so an
+    /// unexpired entry here means a mutation is in progress.  Stored as `bool`.
+    ContractMutationLock(u32),
 }
 
 // ── Two-step Governance Proposal (Issue #1221) ───────────────────────────────
@@ -396,6 +422,27 @@ pub enum Error {
     /// one recorded at contract-creation time.  Re-binding with a different
     /// token scale is not allowed after contracts exist.
     TokenScaleMismatch = 83,
+    /// A mutation was submitted against an obsolete milestone version.
+    StaleMilestoneVersion = 84,
+    /// The expected-version vector does not match the milestone-index vector.
+    InvalidVersionCount = 85,
+    // Concurrent-execution hardening (#1535)
+    /// A storage-mutating operation for this contract is already in flight.
+    ///
+    /// Raised when a re-entrant or interleaved call tries to acquire the
+    /// per-contract mutation lock while another mutation still holds it.  On
+    /// Soroban a transaction is atomic, so seeing this error means a token
+    /// callback re-entered the escrow mid-transfer, or a caller issued two
+    /// overlapping mutations for the same contract.
+    ConcurrentMutation = 86,
+    /// The persisted contract record violates a storage invariant.
+    ///
+    /// Raised when a loaded contract, or the record about to be written, has
+    /// negative accounting fields, a released/refunded sum that exceeds the
+    /// funded amount, or a milestone in an impossible state.  A healthy
+    /// contract can never produce this error, so it always signals corrupted
+    /// or stale on-ledger state discovered before it could be propagated.
+    StorageInvariantViolated = 87,
 }
 
 // ── Core contract state ──────────────────────────────────────────────────────
@@ -544,6 +591,47 @@ pub struct MilestoneApprovals {
 /// Maximum records returned per pagination request across view entrypoints.
 pub const MAX_PAGINATION_LIMIT: u32 = 50;
 
+// ── Settlement state snapshot ────────────────────────────────────────────────
+
+/// Read-only projection of the settlement layer returned by `get_settlement_state`.
+///
+/// Aggregates the two independent settlement storage keys into a single,
+/// versioned snapshot so callers (indexers, clients, off-chain tooling) can
+/// read the full settlement configuration in one call.
+///
+/// ## Invariants
+///
+/// * `token` is `Some` after a successful `bind_settlement_token` and `None`
+///   before any binding.  Once set, it is immutable — it can never revert to
+///   `None`.
+/// * `accumulated_protocol_fees` is always `>= 0`.  Negative values indicate
+///   an accounting invariant violation and should never occur in production.
+/// * This type is **read-only**: `get_settlement_state` never mutates storage.
+///
+/// ## Compatibility
+///
+/// New fields may be added (with defaults) in future schema versions. Existing
+/// consumers should ignore unknown fields if deserialising from raw ledger XDR.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementState {
+    /// The bound SAC token address, or `None` when no token has been bound.
+    pub token: Option<Address>,
+    /// Total protocol fees accumulated from milestone releases, in stroops.
+    ///
+    /// Defaults to `0` before any milestone is released. Always non-negative.
+    pub accumulated_protocol_fees: i128,
+}
+
+impl Default for SettlementState {
+    fn default() -> Self {
+        SettlementState {
+            token: None,
+            accumulated_protocol_fees: 0,
+        }
+    }
+}
+
 /// Bounded pagination record for milestone release authorization status.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -553,6 +641,46 @@ pub struct AuthorizationRecord {
     pub client_approved: bool,
     pub freelancer_approved: bool,
     pub arbiter_approved: bool,
+}
+
+/// Read-only diagnostic view explaining *why* a milestone is or is not releasable.
+///
+/// This type exists so that a failure to release is actionable by the caller
+/// without guessing. [`AuthorizationRecord`] reports which parties have
+/// approved, but it cannot report the contract's
+/// [`ReleaseAuthorization`] mode, the milestone's terminal state, or how many
+/// approvals are still outstanding. This view resolves all of that in a single
+/// read so an integrator can distinguish the four terminal/exhausted outcomes:
+///
+/// * `released` / `refunded` — the milestone is settled; no further approval is useful.
+/// * `release_authorized` — approvals are sufficient right now.
+/// * `has_record == false` while the milestone is open — no live approval record
+///   exists, which covers both "never approved" and "the temporary record was
+///   evicted after `PENDING_APPROVAL_TTL_LEDGERS`". Both require a fresh
+///   approval, so callers need not (and cannot) distinguish them.
+/// * `approvals_missing > 0` with `has_record == true` — a partially satisfied
+///   set is live; the named parties can still approve, or withdraw via
+///   `revoke_milestone_approval`.
+///
+/// The view is derived entirely from stored state and never mutates storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneReleaseReadiness {
+    pub milestone_index: u32,
+    /// `true` when `check_approvals` would currently succeed for this milestone.
+    pub release_authorized: bool,
+    /// `true` when a live temporary approval record exists for this milestone.
+    pub has_record: bool,
+    /// Number of approvals required by the contract's `ReleaseAuthorization` mode.
+    pub approvals_required: u32,
+    /// Number of required approvals currently present.
+    pub approvals_present: u32,
+    /// Number of required approvals still outstanding. `0` when none are missing.
+    pub approvals_missing: u32,
+    /// `true` when the milestone has already been released (terminal).
+    pub released: bool,
+    /// `true` when the milestone has already been refunded (terminal).
+    pub refunded: bool,
 }
 
 #[contracttype]
